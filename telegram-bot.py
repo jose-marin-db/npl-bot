@@ -3,6 +3,8 @@ import random
 import time
 import json
 import os
+import threading
+import hashlib
 import dotenv
 from groq import Groq, RateLimitError
 
@@ -783,17 +785,29 @@ preguntas = [
 ]
 
 # ── Perfiles de usuario ──────────────────────────────────────────────────────
+# En Render el filesystem es efímero: sin disco persistente, los datos se pierden
+# al redeploy/reinicio. Opciones: variable USUARIOS_JSON_PATH apuntando a un
+# volumen montado (Render Disk) o una base externa (p. ej. Postgres).
 
-_RUTA_PERFILES = os.path.join(os.path.dirname(__file__), "usuarios.json")
+def _ruta_usuarios_json() -> str:
+    custom = (os.environ.get("USUARIOS_JSON_PATH") or "").strip()
+    if custom:
+        return os.path.abspath(custom)
+    return os.path.abspath(os.path.join(os.path.dirname(__file__), "usuarios.json"))
 
 def _cargar_perfiles() -> dict:
-    if os.path.exists(_RUTA_PERFILES):
-        with open(_RUTA_PERFILES, encoding="utf-8") as f:
+    ruta = _ruta_usuarios_json()
+    if os.path.exists(ruta):
+        with open(ruta, encoding="utf-8") as f:
             return json.load(f)
     return {}
 
 def _guardar_perfiles(perfiles: dict):
-    with open(_RUTA_PERFILES, "w", encoding="utf-8") as f:
+    ruta = _ruta_usuarios_json()
+    parent = os.path.dirname(ruta)
+    if parent:
+        os.makedirs(parent, exist_ok=True)
+    with open(ruta, "w", encoding="utf-8") as f:
         json.dump(perfiles, f, ensure_ascii=False, indent=2)
 
 perfiles_usuarios = _cargar_perfiles()
@@ -1014,5 +1028,89 @@ def cb_mas_teoria(call):
         )
     )
 
-print("Bot iniciado. Esperando mensajes...")
-bot.polling(none_stop=True)
+
+def _webhook_path_secret() -> str:
+    """Segmento de URL no adivinable; Telegram solo debe POSTear aquí."""
+    explicit = (os.environ.get("WEBHOOK_SECRET") or "").strip()
+    if explicit:
+        return explicit
+    t = os.getenv("token") or ""
+    if len(t) < 16:
+        return "cambiar-webhook-secret"
+    return hashlib.sha256(t.encode()).hexdigest()[:32]
+
+
+def create_web_app():
+    """
+    Servidor HTTP para Render (Web Service): salud en / y webhook de Telegram.
+    Con RENDER_EXTERNAL_URL (lo define Render) registra webhook para que cada
+    mensaje despierte la instancia; sin eso, hace polling en un hilo (útil en local).
+    """
+    from flask import Flask, request
+
+    app = Flask(__name__)
+    secret = _webhook_path_secret()
+
+    @app.route(f"/tgwh/{secret}", methods=["POST"])
+    def telegram_webhook():
+        if not request.is_json:
+            return "", 400
+        body = request.get_json(silent=True)
+        if not isinstance(body, dict):
+            return "", 400
+        try:
+            update = telebot.types.Update.de_json(body)
+            bot.process_new_updates([update])
+        except Exception as e:
+            print(f"[webhook] error al procesar update: {e}")
+            return "", 500
+        return "", 200
+
+    @app.get("/")
+    def health():
+        return "ok", 200
+
+    base = (os.environ.get("RENDER_EXTERNAL_URL") or "").rstrip("/")
+    if base and TOKEN:
+        hook = f"{base}/tgwh/{secret}"
+        try:
+            bot.remove_webhook()
+            time.sleep(0.25)
+            bot.set_webhook(
+                url=hook,
+                max_connections=40,
+                allowed_updates=[
+                    "message",
+                    "edited_message",
+                    "callback_query",
+                    "poll_answer",
+                ],
+            )
+            print(f"[webhook] registrado: {hook}")
+        except Exception as e:
+            print(f"[webhook] no se pudo registrar ({e}); usando polling en segundo plano.")
+            threading.Thread(
+                target=lambda: bot.infinity_polling(timeout=60, long_polling_timeout=60),
+                daemon=True,
+            ).start()
+    else:
+        print("[web] Sin RENDER_EXTERNAL_URL o token vacío: polling en segundo plano.")
+        threading.Thread(
+            target=lambda: bot.infinity_polling(timeout=60, long_polling_timeout=60),
+            daemon=True,
+        ).start()
+
+    return app
+
+
+web_app = None
+if os.environ.get("PORT"):
+    web_app = create_web_app()
+
+if __name__ == "__main__":
+    port = os.environ.get("PORT")
+    if port and web_app is not None:
+        web_app.run(host="0.0.0.0", port=int(port), threaded=True)
+    else:
+        print("Bot iniciado. Esperando mensajes (polling local)...")
+        bot.infinity_polling(timeout=60, long_polling_timeout=60)

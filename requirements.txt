@@ -1,3 +1,5 @@
 pyTelegramBotAPI
 python-dotenv
 groq
+flask>=3.0
+gunicorn>=22.0

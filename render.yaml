@@ -1,0 +1,15 @@
+# Blueprint Render: https://render.com/docs/yaml-spec
+# Tras conectar el repo, ajustá nombre/región y definí en el dashboard:
+#   token, GROQ_TOKEN  (y opcional: GROQ_MODEL, USUARIOS_JSON_PATH, WEBHOOK_SECRET)
+services:
+  - type: web
+    name: udesa-bot
+    runtime: python
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: gunicorn app:app --bind 0.0.0.0:$PORT --workers 1 --threads 2
+    envVars:
+      - key: token
+        sync: false
+      - key: GROQ_TOKEN
+        sync: false
